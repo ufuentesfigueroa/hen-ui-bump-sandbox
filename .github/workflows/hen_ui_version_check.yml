@@ -1,0 +1,229 @@
+name: Hen UI Version Check
+run-name: Hen UI Version Check @${{ github.actor }} - ${{ github.head_ref || github.ref_name }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRATEGY: Auto-bump at merge queue time (Option A)
+#
+# pull_request  →  soft check only.
+#   - Version went backwards?  Hard fail (always a dev error).
+#   - Version not bumped?      Warning + explain that the merge queue will fix it.
+#   - Lockfile drift?          Hard fail (dev must run `npm install` locally).
+#   - Everything OK?           Pass.
+#
+# merge_group   →  auto-bump + lockfile patch + commit.
+#   - Version went backwards?  Hard fail.
+#   - Version not bumped?      Auto-bump minor, patch lockfile, commit + push to
+#                              the queue branch so main receives the bumped version.
+#   - Version already bumped?  Still patch lockfile if it drifted, commit if needed.
+#   - Exit 0 in all non-failure cases so the merge queue check goes green.
+#
+# Why merge queue is collision-safe:
+#   GitHub processes queue entries sequentially. PR-A bumps 0.17.46 → 0.17.47 and
+#   merges. PR-B's queue entry then starts from main@0.17.47 and bumps to 0.17.48.
+#   Two PRs can never land on the same version.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches:
+      - main
+      - release
+    paths:
+      - 'packages/hen-ui/**'
+      - 'packages/csf-parser/**'
+      - 'hen-ui-catalog/**'
+
+  merge_group:
+    branches:
+      - main
+
+  # Manual trigger for sandbox testing — lets you simulate merge_group logic
+  # without waiting for a real queue entry.
+  workflow_dispatch:
+    inputs:
+      simulate_event:
+        description: 'Which event to simulate'
+        required: true
+        default: 'merge_group'
+        type: choice
+        options:
+          - merge_group
+          - pull_request
+
+permissions:
+  contents: write   # write needed to push the auto-bump commit on merge_group
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      # Use github.ref so that:
+      #   - On merge_group: checks out the gh-readonly-queue branch ref (not a
+      #     detached SHA), which allows git push back to the same branch.
+      #   - On pull_request: checks out the PR merge ref (read-only, no push needed).
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref }}
+
+      # ── Resolve effective event (handles workflow_dispatch simulation) ─────
+      - name: Resolve effective event
+        id: ctx
+        run: |
+          EVENT="${{ github.event_name }}"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            EVENT="${{ inputs.simulate_event }}"
+            echo "Simulating event: $EVENT"
+          fi
+          echo "event=$EVENT" >> "$GITHUB_OUTPUT"
+
+      # ── Current version (from the PR / queue branch) ───────────────────────
+      - name: Get current version
+        id: current
+        run: |
+          VERSION=$(node -p "require('./packages/hen-ui/package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Current version: $VERSION"
+
+      # ── Base version (from main) ───────────────────────────────────────────
+      - name: Get base version (main)
+        id: base
+        run: |
+          git fetch origin main --depth=1
+          VERSION=$(git show "origin/main:packages/hen-ui/package.json" \
+            | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Base (main) version: $VERSION"
+
+      # ── Version validation / auto-bump ────────────────────────────────────
+      - name: Validate or auto-bump version
+        id: bump
+        run: |
+          CURRENT="${{ steps.current.outputs.version }}"
+          BASE="${{ steps.base.outputs.version }}"
+          EVENT="${{ steps.ctx.outputs.event }}"
+
+          echo "Base (main): $BASE"
+          echo "Current:     $CURRENT"
+          echo "Event:       $EVENT"
+          echo ""
+
+          # ── Always fail if version went backwards ──────────────────────────
+          node -e "
+            const [c, b] = ['$CURRENT', '$BASE'].map(v => v.split('.').map(Number));
+            const lt = c[0] < b[0]
+              || (c[0] === b[0] && c[1] < b[1])
+              || (c[0] === b[0] && c[1] === b[1] && c[2] < b[2]);
+            if (lt) {
+              console.error('::error::hen-ui version went backwards (' + '$BASE' + ' → ' + '$CURRENT' + '). Must be higher than main. Fix manually.');
+              process.exit(1);
+            }
+          "
+
+          if [ "$CURRENT" = "$BASE" ]; then
+            if [ "$EVENT" = "merge_group" ]; then
+              # ── MERGE QUEUE: auto-bump ─────────────────────────────────────
+              echo "Version not bumped — performing auto minor bump in merge queue"
+              cd packages/hen-ui
+              npm version minor --no-git-tag-version --no-commit-hooks
+              cd ../..
+              NEW=$(node -p "require('./packages/hen-ui/package.json').version")
+              echo "new_version=$NEW" >> "$GITHUB_OUTPUT"
+              echo "bumped=true"      >> "$GITHUB_OUTPUT"
+              echo ""
+              echo "Auto-bumped: $BASE → $NEW"
+            else
+              # ── PULL REQUEST: soft warning, do not fail ─────────────────────
+              echo "::warning::hen-ui version ($CURRENT) has not been bumped above main ($BASE)."
+              echo "::warning::The merge queue will automatically apply a minor bump when this PR is queued for merge."
+              echo "::warning::If you want to control the bump type (patch/major), bump manually before merging: cd packages/hen-ui && npm version <patch|minor|major> --no-git-tag-version"
+              echo "bumped=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Version already bumped: $BASE → $CURRENT ✓"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Lockfile patch (merge_group only) ─────────────────────────────────
+      # On pull_request the lockfile check is a hard failure below (dev must fix
+      # it locally). On merge_group we patch it in CI so main always receives a
+      # consistent state even if the dev forgot to run `npm install`.
+      - name: Patch package-lock.json (merge_group)
+        if: steps.ctx.outputs.event == 'merge_group'
+        run: |
+          node << 'NODE'
+          const fs = require('fs');
+          const pkg  = JSON.parse(fs.readFileSync('packages/hen-ui/package.json', 'utf8'));
+          const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+
+          const entry = lock.packages && lock.packages['packages/hen-ui'];
+          if (!entry) {
+            console.error("::error::packages['packages/hen-ui'] not found in package-lock.json. Cannot patch.");
+            process.exit(1);
+          }
+
+          const was = entry.version;
+          entry.version = pkg.version;
+          fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2) + '\n');
+
+          if (was === pkg.version) {
+            console.log(`package-lock.json already in sync at ${pkg.version}`);
+          } else {
+            console.log(`Lockfile patched: ${was} → ${pkg.version}`);
+          }
+          NODE
+
+      # ── Commit and push auto-fixes (merge_group only) ─────────────────────
+      - name: Commit and push auto-bump (merge_group)
+        if: steps.ctx.outputs.event == 'merge_group'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add packages/hen-ui/package.json package-lock.json
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit — version was already bumped and lockfile was in sync."
+          else
+            NEW_VERSION=$(node -p "require('./packages/hen-ui/package.json').version")
+            git commit -m "chore(hen-ui): auto-bump to ${NEW_VERSION} [merge-queue]"
+            git push
+            echo ""
+            echo "Pushed auto-bump commit → ${NEW_VERSION}"
+          fi
+
+      # ── Lockfile sync check (pull_request only) ────────────────────────────
+      # On a PR, the dev is responsible for keeping the lockfile in sync. If they
+      # bumped package.json manually but forgot npm install, this catches it before
+      # review is complete (rather than surfacing it in the merge queue later).
+      - name: Verify package-lock.json in sync (pull_request)
+        if: steps.ctx.outputs.event == 'pull_request'
+        run: |
+          node << 'NODE'
+          const fs = require('fs');
+          const pkg  = JSON.parse(fs.readFileSync('packages/hen-ui/package.json', 'utf8'));
+          const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+          const entry = lock.packages && lock.packages['packages/hen-ui'];
+
+          if (!entry || typeof entry.version !== 'string') {
+            console.error(
+              "::error::Could not read packages['packages/hen-ui'].version from package-lock.json. " +
+              "From the site-publishing repo root run: npm install"
+            );
+            process.exit(1);
+          }
+
+          if (entry.version !== pkg.version) {
+            console.error(
+              `::error::Lockfile drift: package-lock.json has packages/hen-ui@${entry.version} ` +
+              `but packages/hen-ui/package.json has ${pkg.version}. ` +
+              'From the monorepo root run `npm install`, then commit the updated package-lock.json.'
+            );
+            process.exit(1);
+          }
+
+          console.log(`package-lock.json OK: packages/hen-ui@${entry.version} matches package.json ✓`);
+          NODE
